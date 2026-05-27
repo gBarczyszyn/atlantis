@@ -90,6 +90,7 @@ type UserConfig struct {
 	MCPEnabled                      bool   `mapstructure:"mcp-enabled"`
 	MCPPort                         int    `mapstructure:"mcp-port"`
 	MCPToken                        string `mapstructure:"mcp-token"`
+	MCPWriteEnabled                 bool   `mapstructure:"mcp-write-enabled"`
 	IgnoreVCSStatusNames            string `mapstructure:"ignore-vcs-status-names"`
 	ParallelPoolSize                int    `mapstructure:"parallel-pool-size"`
 	ParallelPlan                    bool   `mapstructure:"parallel-plan"`

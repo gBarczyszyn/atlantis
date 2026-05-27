@@ -113,6 +113,7 @@ var testFlags = map[string]any{
 	MCPEnabledFlag:                   true,
 	MCPPortFlag:                      4142,
 	MCPTokenFlag:                     "mcp-secret",
+	MCPWriteEnabledFlag:              true,
 	StatsNamespace:                   "atlantis",
 	AllowDraftPRs:                    true,
 	PortFlag:                         8181,

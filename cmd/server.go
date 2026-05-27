@@ -118,6 +118,7 @@ const (
 	MCPEnabledFlag                   = "mcp-enabled"
 	MCPPortFlag                      = "mcp-port"
 	MCPTokenFlag                     = "mcp-token"
+	MCPWriteEnabledFlag              = "mcp-write-enabled"
 	ParallelPoolSize                 = "parallel-pool-size"
 	PendingApplyStatusFlag           = "pending-apply-status"
 	StatsNamespace                   = "stats-namespace"
@@ -582,6 +583,12 @@ var boolFlags = map[string]boolFlag{
 			"Atlantis state (locks, version) as tools for AI assistants. Served on a separate port, see --" + MCPPortFlag + ".",
 		defaultValue: false,
 	},
+	MCPWriteEnabledFlag: {
+		description: "Also expose the mutating MCP tools (plan, apply, unlock) in addition to the read-only ones. " +
+			"Requires --" + MCPEnabledFlag + ". Like the Atlantis API, apply does not enforce PR-based approval/mergeable " +
+			"requirements, so anyone holding the MCP token can change infrastructure on allowlisted repos. Keep --" + MCPTokenFlag + " set.",
+		defaultValue: false,
+	},
 	ParallelPlanFlag: {
 		description:  "Run plan operations in parallel.",
 		defaultValue: false,
@@ -1034,6 +1041,10 @@ func (s *ServerCmd) validate(userConfig server.UserConfig) error {
 			CheckoutStrategyBranch, CheckoutStrategyMerge)
 	}
 
+	if userConfig.MCPWriteEnabled && !userConfig.MCPEnabled {
+		return fmt.Errorf("--%s requires --%s", MCPWriteEnabledFlag, MCPEnabledFlag)
+	}
+
 	if (userConfig.SSLKeyFile == "") != (userConfig.SSLCertFile == "") {
 		return fmt.Errorf("--%s and --%s are both required for ssl", SSLKeyFileFlag, SSLCertFileFlag)
 	}
@@ -1228,6 +1239,9 @@ func (s *ServerCmd) securityWarnings(userConfig *server.UserConfig) {
 	}
 	if userConfig.MCPEnabled && userConfig.MCPToken == "" && !s.SilenceOutput {
 		s.Logger.Warn("no MCP token set. The MCP server is unauthenticated and should only be reachable over a trusted network")
+	}
+	if userConfig.MCPWriteEnabled && !s.SilenceOutput {
+		s.Logger.Warn("MCP write tools (plan, apply, unlock) are enabled. Anyone holding the MCP token can change infrastructure on allowlisted repos; apply does not enforce PR-based approval requirements")
 	}
 }
 

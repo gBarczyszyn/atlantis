@@ -95,24 +95,18 @@ func (a *APIController) apiReportError(w http.ResponseWriter, code int, err erro
 func (a *APIController) Plan(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
 
-	request, ctx, code, err := a.apiParseAndValidate(r)
+	request, code, err := a.parseAPIRequest(r)
 	if err != nil {
 		a.apiReportError(w, code, err)
 		return
 	}
 
-	err = a.apiSetup(ctx, command.Plan)
+	result, err := a.RunPlan(request)
 	if err != nil {
 		a.apiReportError(w, http.StatusInternalServerError, err)
 		return
 	}
-
-	result, err := a.apiPlan(request, ctx)
-	if err != nil {
-		a.apiReportError(w, http.StatusInternalServerError, err)
-		return
-	}
-	defer a.Locker.UnlockByPull(ctx.HeadRepo.FullName, ctx.Pull.Num) // nolint: errcheck
+	code = http.StatusOK
 	if result.HasErrors() {
 		code = http.StatusInternalServerError
 	}
@@ -129,32 +123,18 @@ func (a *APIController) Plan(w http.ResponseWriter, r *http.Request) {
 func (a *APIController) Apply(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
 
-	request, ctx, code, err := a.apiParseAndValidate(r)
+	request, code, err := a.parseAPIRequest(r)
 	if err != nil {
 		a.apiReportError(w, code, err)
 		return
 	}
 
-	err = a.apiSetup(ctx, command.Apply)
+	result, err := a.RunApply(request)
 	if err != nil {
 		a.apiReportError(w, http.StatusInternalServerError, err)
 		return
 	}
-
-	// We must first make the plan for all projects
-	_, err = a.apiPlan(request, ctx)
-	if err != nil {
-		a.apiReportError(w, http.StatusInternalServerError, err)
-		return
-	}
-	defer a.Locker.UnlockByPull(ctx.HeadRepo.FullName, ctx.Pull.Num) // nolint: errcheck
-
-	// We can now prepare and run the apply step
-	result, err := a.apiApply(request, ctx)
-	if err != nil {
-		a.apiReportError(w, http.StatusInternalServerError, err)
-		return
-	}
+	code = http.StatusOK
 	if result.HasErrors() {
 		code = http.StatusInternalServerError
 	}
@@ -333,50 +313,57 @@ func (a *APIController) apiApply(request *APIRequest, ctx *command.Context) (*co
 	return &command.Result{ProjectResults: projectResults}, nil
 }
 
-func (a *APIController) apiParseAndValidate(r *http.Request) (*APIRequest, *command.Context, int, error) {
+// parseAPIRequest authenticates and decodes an HTTP API request. It is only
+// used by the HTTP handlers; the MCP server builds the APIRequest directly.
+func (a *APIController) parseAPIRequest(r *http.Request) (*APIRequest, int, error) {
 	if len(a.APISecret) == 0 {
-		return nil, nil, http.StatusBadRequest, fmt.Errorf("ignoring request since API is disabled")
+		return nil, http.StatusBadRequest, fmt.Errorf("ignoring request since API is disabled")
 	}
 
 	// Validate the secret token
 	secret := r.Header.Get(atlantisTokenHeader)
 	if secret != string(a.APISecret) {
-		return nil, nil, http.StatusUnauthorized, fmt.Errorf("header %s did not match expected secret", atlantisTokenHeader)
+		return nil, http.StatusUnauthorized, fmt.Errorf("header %s did not match expected secret", atlantisTokenHeader)
 	}
 
 	// Parse the JSON payload
 	bytes, err := io.ReadAll(r.Body)
 	if err != nil {
-		return nil, nil, http.StatusBadRequest, fmt.Errorf("failed to read request")
+		return nil, http.StatusBadRequest, fmt.Errorf("failed to read request")
 	}
 	var request APIRequest
 	if err = json.Unmarshal(bytes, &request); err != nil {
-		return nil, nil, http.StatusBadRequest, fmt.Errorf("failed to parse request: %v", err.Error())
+		return nil, http.StatusBadRequest, fmt.Errorf("failed to parse request: %v", err.Error())
 	}
 	if err = validator.New().Struct(request); err != nil {
-		return nil, nil, http.StatusBadRequest, fmt.Errorf("request %q is missing fields", string(bytes))
+		return nil, http.StatusBadRequest, fmt.Errorf("request %q is missing fields", string(bytes))
 	}
+	return &request, http.StatusOK, nil
+}
 
+// buildContext validates the repo against the allowlist and builds a command
+// context for the request. Shared by the HTTP API and the MCP server.
+func (a *APIController) buildContext(request *APIRequest) (*command.Context, int, error) {
 	VCSHostType, err := models.NewVCSHostType(request.Type)
 	if err != nil {
-		return nil, nil, http.StatusBadRequest, err
+		return nil, http.StatusBadRequest, err
 	}
 	cloneURL, err := a.VCSClient.GetCloneURL(a.Logger, VCSHostType, request.Repository)
 	if err != nil {
-		return nil, nil, http.StatusInternalServerError, err
+		return nil, http.StatusInternalServerError, err
 	}
 
 	baseRepo, err := a.Parser.ParseAPIPlanRequest(VCSHostType, request.Repository, cloneURL)
 	if err != nil {
-		return nil, nil, http.StatusBadRequest, fmt.Errorf("failed to parse request: %v", err)
+		return nil, http.StatusBadRequest, fmt.Errorf("failed to parse request: %v", err)
 	}
 
 	// Check if the repo is allowlisted
 	if !a.RepoAllowlistChecker.IsAllowlisted(baseRepo.FullName, baseRepo.VCSHost.Hostname) {
-		return nil, nil, http.StatusForbidden, fmt.Errorf("repo not allowlisted")
+		return nil, http.StatusForbidden, fmt.Errorf("repo not allowlisted")
 	}
 
-	return &request, &command.Context{
+	return &command.Context{
 		HeadRepo: baseRepo,
 		Pull: models.PullRequest{
 			Num:        request.PR,
@@ -389,6 +376,45 @@ func (a *APIController) apiParseAndValidate(r *http.Request) (*APIRequest, *comm
 		Log:   a.Logger,
 		API:   true,
 	}, http.StatusOK, nil
+}
+
+// RunPlan validates the request, prepares the workspace, and runs plan. It is
+// shared by the HTTP API handler and the MCP server.
+func (a *APIController) RunPlan(request *APIRequest) (*command.Result, error) {
+	if err := validator.New().Struct(request); err != nil {
+		return nil, fmt.Errorf("request is missing required fields (Repository, Ref, Type)")
+	}
+	ctx, _, err := a.buildContext(request)
+	if err != nil {
+		return nil, err
+	}
+	if err := a.apiSetup(ctx, command.Plan); err != nil {
+		return nil, err
+	}
+	defer a.Locker.UnlockByPull(ctx.HeadRepo.FullName, ctx.Pull.Num) // nolint: errcheck
+	return a.apiPlan(request, ctx)
+}
+
+// RunApply validates the request, plans, and then applies. It is shared by the
+// HTTP API handler and the MCP server. Like the HTTP API it operates on a
+// repo/ref and does not enforce PR-based apply requirements.
+func (a *APIController) RunApply(request *APIRequest) (*command.Result, error) {
+	if err := validator.New().Struct(request); err != nil {
+		return nil, fmt.Errorf("request is missing required fields (Repository, Ref, Type)")
+	}
+	ctx, _, err := a.buildContext(request)
+	if err != nil {
+		return nil, err
+	}
+	if err := a.apiSetup(ctx, command.Apply); err != nil {
+		return nil, err
+	}
+	defer a.Locker.UnlockByPull(ctx.HeadRepo.FullName, ctx.Pull.Num) // nolint: errcheck
+	// We must first plan for all projects before applying.
+	if _, err := a.apiPlan(request, ctx); err != nil {
+		return nil, err
+	}
+	return a.apiApply(request, ctx)
 }
 
 func (a *APIController) respond(w http.ResponseWriter, lvl logging.LogLevel, responseCode int, format string, args ...any) {

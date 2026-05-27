@@ -17,10 +17,28 @@ import (
 
 	"github.com/mark3labs/mcp-go/mcp"
 	mcpserver "github.com/mark3labs/mcp-go/server"
+	"github.com/runatlantis/atlantis/server/controllers"
 	"github.com/runatlantis/atlantis/server/core/locking"
+	"github.com/runatlantis/atlantis/server/events"
+	"github.com/runatlantis/atlantis/server/events/command"
 	"github.com/runatlantis/atlantis/server/events/models"
 	"github.com/runatlantis/atlantis/server/logging"
 )
+
+// WriteService runs plan/apply commands. It is implemented by
+// *controllers.APIController so the MCP server reuses the same machinery as the
+// HTTP API.
+type WriteService interface {
+	RunPlan(request *controllers.APIRequest) (*command.Result, error)
+	RunApply(request *controllers.APIRequest) (*command.Result, error)
+}
+
+// WriteDeps holds the dependencies for the mutating MCP tools (plan, apply,
+// unlock). When nil, only the read-only tools are registered.
+type WriteDeps struct {
+	Service    WriteService
+	DeleteLock events.DeleteLockCommand
+}
 
 // Server wraps an MCP server exposing read-only Atlantis tools over streamable
 // HTTP on a dedicated port.
@@ -47,8 +65,10 @@ type lockView struct {
 // If token is non-empty, every request must carry a matching
 // "Authorization: Bearer <token>" header, except for the /healthz endpoint
 // which is always unauthenticated so load balancers can probe it.
-func NewServer(port int, version, token string, locker locking.Locker, logger logging.SimpleLogging) *Server {
-	mcpHandler := bearerAuth(token, mcpserver.NewStreamableHTTPServer(newMCPServer(version, locker)))
+// If write is non-nil, the mutating tools (plan, apply, unlock) are also
+// registered; otherwise only the read-only tools are exposed.
+func NewServer(port int, version, token string, locker locking.Locker, write *WriteDeps, logger logging.SimpleLogging) *Server {
+	mcpHandler := bearerAuth(token, mcpserver.NewStreamableHTTPServer(newMCPServer(version, locker, write, logger)))
 	mux := http.NewServeMux()
 	mux.HandleFunc("/healthz", healthz)
 	mux.Handle("/", mcpHandler)
@@ -88,7 +108,7 @@ func bearerAuth(token string, next http.Handler) http.Handler {
 	})
 }
 
-func newMCPServer(version string, locker locking.Locker) *mcpserver.MCPServer {
+func newMCPServer(version string, locker locking.Locker, write *WriteDeps, logger logging.SimpleLogging) *mcpserver.MCPServer {
 	s := mcpserver.NewMCPServer(
 		"atlantis",
 		version,
@@ -96,6 +116,9 @@ func newMCPServer(version string, locker locking.Locker) *mcpserver.MCPServer {
 		mcpserver.WithRecovery(),
 	)
 	registerTools(s, locker, version)
+	if write != nil {
+		registerWriteTools(s, write, logger)
+	}
 	return s
 }
 
@@ -149,6 +172,155 @@ func registerTools(s *mcpserver.MCPServer, locker locking.Locker, version string
 			return jsonResult(newLockView(id, *lock))
 		},
 	)
+}
+
+// planApplyArgs are the shared tool arguments for atlantis_plan/atlantis_apply.
+func planApplyArgs() []mcp.ToolOption {
+	return []mcp.ToolOption{
+		mcp.WithString("repo", mcp.Required(), mcp.Description("Repository full name, e.g. owner/repo.")),
+		mcp.WithString("ref", mcp.Required(), mcp.Description("Git branch or commit ref to operate on.")),
+		mcp.WithString("type", mcp.Description("VCS host type: Github, Gitlab, Gitea, BitbucketCloud, BitbucketServer, AzureDevops. Defaults to Github.")),
+		mcp.WithInteger("pr", mcp.Description("Optional pull request number for context and locking.")),
+		mcp.WithArray("projects", mcp.Description("Project names to target, as defined in atlantis.yaml."), mcp.WithStringItems()),
+		mcp.WithString("dir", mcp.Description("Directory to target (alternative to projects).")),
+		mcp.WithString("workspace", mcp.Description("Terraform workspace for 'dir'. Defaults to 'default'.")),
+	}
+}
+
+func registerWriteTools(s *mcpserver.MCPServer, write *WriteDeps, logger logging.SimpleLogging) {
+	s.AddTool(
+		mcp.NewTool("atlantis_plan", append([]mcp.ToolOption{
+			mcp.WithDescription("Run 'atlantis plan' for a repo/ref and return the terraform plan output per project. Specify projects (by name) and/or a dir."),
+			mcp.WithOpenWorldHintAnnotation(true),
+		}, planApplyArgs()...)...),
+		func(_ context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+			apiReq, err := buildAPIRequest(req)
+			if err != nil {
+				return mcp.NewToolResultError(err.Error()), nil
+			}
+			logger.Info("MCP plan requested: repo=%s ref=%s projects=%v paths=%d", apiReq.Repository, apiReq.Ref, apiReq.Projects, len(apiReq.Paths))
+			result, err := write.Service.RunPlan(apiReq)
+			if err != nil {
+				return mcp.NewToolResultError(fmt.Sprintf("plan failed: %s", err)), nil
+			}
+			return formatResult(result)
+		},
+	)
+
+	s.AddTool(
+		mcp.NewTool("atlantis_apply", append([]mcp.ToolOption{
+			mcp.WithDescription("Run 'atlantis apply' for a repo/ref (real terraform apply). Plans first, then applies. NOTE: like the Atlantis API, this does NOT enforce PR-based approval/mergeable requirements."),
+			mcp.WithDestructiveHintAnnotation(true),
+			mcp.WithOpenWorldHintAnnotation(true),
+		}, planApplyArgs()...)...),
+		func(_ context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+			apiReq, err := buildAPIRequest(req)
+			if err != nil {
+				return mcp.NewToolResultError(err.Error()), nil
+			}
+			logger.Warn("MCP apply requested: repo=%s ref=%s projects=%v paths=%d", apiReq.Repository, apiReq.Ref, apiReq.Projects, len(apiReq.Paths))
+			result, err := write.Service.RunApply(apiReq)
+			if err != nil {
+				return mcp.NewToolResultError(fmt.Sprintf("apply failed: %s", err)), nil
+			}
+			return formatResult(result)
+		},
+	)
+
+	s.AddTool(
+		mcp.NewTool("atlantis_unlock",
+			mcp.WithDescription("Delete an Atlantis project lock (and its saved plan) by lock id."),
+			mcp.WithDestructiveHintAnnotation(true),
+			mcp.WithIdempotentHintAnnotation(true),
+			mcp.WithString("id", mcp.Required(), mcp.Description("The lock id, as returned by atlantis_list_locks.")),
+		),
+		func(_ context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+			id, err := req.RequireString("id")
+			if err != nil {
+				return mcp.NewToolResultError(err.Error()), nil
+			}
+			logger.Warn("MCP unlock requested: id=%s", id)
+			lock, err := write.DeleteLock.DeleteLock(logger, id)
+			if err != nil {
+				return mcp.NewToolResultError(fmt.Sprintf("unlock failed: %s", err)), nil
+			}
+			if lock == nil {
+				return mcp.NewToolResultError(fmt.Sprintf("no lock found with id %q", id)), nil
+			}
+			return mcp.NewToolResultText(fmt.Sprintf("unlocked %q (project %q, workspace %q)", id, lock.Project.ProjectName, lock.Workspace)), nil
+		},
+	)
+}
+
+// buildAPIRequest constructs an APIRequest from the tool arguments. At least one
+// of "projects" or "dir" must be supplied.
+func buildAPIRequest(req mcp.CallToolRequest) (*controllers.APIRequest, error) {
+	repo, err := req.RequireString("repo")
+	if err != nil {
+		return nil, err
+	}
+	ref, err := req.RequireString("ref")
+	if err != nil {
+		return nil, err
+	}
+	apiReq := &controllers.APIRequest{
+		Repository: repo,
+		Ref:        ref,
+		Type:       req.GetString("type", "Github"),
+		PR:         req.GetInt("pr", 0),
+		Projects:   req.GetStringSlice("projects", nil),
+	}
+	if dir := req.GetString("dir", ""); dir != "" {
+		apiReq.Paths = append(apiReq.Paths, struct {
+			Directory string
+			Workspace string
+		}{Directory: dir, Workspace: req.GetString("workspace", "default")})
+	}
+	if len(apiReq.Projects) == 0 && len(apiReq.Paths) == 0 {
+		return nil, fmt.Errorf("specify at least one of 'projects' or 'dir'")
+	}
+	return apiReq, nil
+}
+
+// projectResultView is the JSON shape returned by the plan/apply tools.
+type projectResultView struct {
+	Project   string `json:"project,omitempty"`
+	Dir       string `json:"dir,omitempty"`
+	Workspace string `json:"workspace,omitempty"`
+	Status    string `json:"status"`
+	Output    string `json:"output,omitempty"`
+	Error     string `json:"error,omitempty"`
+}
+
+// formatResult turns a command.Result into a tool result, flagging it as an
+// error result if any project failed.
+func formatResult(result *command.Result) (*mcp.CallToolResult, error) {
+	views := make([]projectResultView, 0, len(result.ProjectResults))
+	hasErr := false
+	for _, pr := range result.ProjectResults {
+		v := projectResultView{Project: pr.ProjectName, Dir: pr.RepoRelDir, Workspace: pr.Workspace}
+		switch {
+		case pr.Error != nil:
+			v.Status, v.Error, hasErr = "error", pr.Error.Error(), true
+		case pr.Failure != "":
+			v.Status, v.Error, hasErr = "failure", pr.Failure, true
+		case pr.PlanSuccess != nil:
+			v.Status, v.Output = "planned", pr.PlanSuccess.TerraformOutput
+		case pr.ApplySuccess != "":
+			v.Status, v.Output = "applied", pr.ApplySuccess
+		default:
+			v.Status = "ok"
+		}
+		views = append(views, v)
+	}
+	b, err := json.MarshalIndent(views, "", "  ")
+	if err != nil {
+		return mcp.NewToolResultError(fmt.Sprintf("marshaling result: %s", err)), nil
+	}
+	if hasErr {
+		return mcp.NewToolResultError(string(b)), nil
+	}
+	return mcp.NewToolResultText(string(b)), nil
 }
 
 func newLockView(id string, lock models.ProjectLock) lockView {

@@ -18,7 +18,9 @@ import (
 
 	"github.com/mark3labs/mcp-go/client"
 	"github.com/mark3labs/mcp-go/mcp"
+	"github.com/runatlantis/atlantis/server/controllers"
 	"github.com/runatlantis/atlantis/server/core/locking"
+	"github.com/runatlantis/atlantis/server/events/command"
 	"github.com/runatlantis/atlantis/server/events/models"
 	"github.com/runatlantis/atlantis/server/logging"
 	. "github.com/runatlantis/atlantis/testing"
@@ -48,9 +50,45 @@ func (f *fakeLocker) TryLock(models.Project, string, models.PullRequest, models.
 func (f *fakeLocker) Unlock(string) (*models.ProjectLock, error)             { return nil, nil }
 func (f *fakeLocker) UnlockByPull(string, int) ([]models.ProjectLock, error) { return nil, nil }
 
+type fakeWriteService struct {
+	planReq  *controllers.APIRequest
+	applyReq *controllers.APIRequest
+	result   *command.Result
+	err      error
+}
+
+func (f *fakeWriteService) RunPlan(r *controllers.APIRequest) (*command.Result, error) {
+	f.planReq = r
+	return f.result, f.err
+}
+
+func (f *fakeWriteService) RunApply(r *controllers.APIRequest) (*command.Result, error) {
+	f.applyReq = r
+	return f.result, f.err
+}
+
+type fakeDeleteLock struct {
+	gotID string
+	lock  *models.ProjectLock
+	err   error
+}
+
+func (f *fakeDeleteLock) DeleteLock(_ logging.SimpleLogging, id string) (*models.ProjectLock, error) {
+	f.gotID = id
+	return f.lock, f.err
+}
+
+func (f *fakeDeleteLock) DeleteLocksByPull(logging.SimpleLogging, string, int) (int, error) {
+	return 0, nil
+}
+
 func testClient(t *testing.T, locker locking.Locker) (*client.Client, context.Context) {
+	return testClientWrite(t, locker, nil)
+}
+
+func testClientWrite(t *testing.T, locker locking.Locker, write *WriteDeps) (*client.Client, context.Context) {
 	t.Helper()
-	c, err := client.NewInProcessClient(newMCPServer("v1.2.3", locker))
+	c, err := client.NewInProcessClient(newMCPServer("v1.2.3", locker, write, logging.NewNoopLogger(t)))
 	Ok(t, err)
 	ctx := context.Background()
 	Ok(t, c.Start(ctx))
@@ -58,6 +96,85 @@ func testClient(t *testing.T, locker locking.Locker) (*client.Client, context.Co
 	Ok(t, err)
 	t.Cleanup(func() { c.Close() })
 	return c, ctx
+}
+
+func writeDeps() (*fakeWriteService, *fakeDeleteLock, *WriteDeps) {
+	svc := &fakeWriteService{result: &command.Result{ProjectResults: []command.ProjectResult{
+		{
+			ProjectName:          "proj1",
+			Workspace:            "default",
+			ProjectCommandOutput: command.ProjectCommandOutput{PlanSuccess: &models.PlanSuccess{TerraformOutput: "1 to add"}},
+		},
+	}}}
+	del := &fakeDeleteLock{lock: &models.ProjectLock{Workspace: "default"}}
+	return svc, del, &WriteDeps{Service: svc, DeleteLock: del}
+}
+
+func TestWriteToolsDisabled(t *testing.T) {
+	c, ctx := testClient(t, &fakeLocker{}) // write deps nil
+	req := mcp.CallToolRequest{}
+	req.Params.Name = "atlantis_plan"
+	req.Params.Arguments = map[string]any{"repo": "o/r", "ref": "main", "projects": []any{"p"}}
+	res, err := c.CallTool(ctx, req)
+	Assert(t, err != nil || res.IsError, "plan tool must be unavailable when write is disabled")
+}
+
+func TestPlanTool(t *testing.T) {
+	svc, _, deps := writeDeps()
+	c, ctx := testClientWrite(t, &fakeLocker{}, deps)
+	req := mcp.CallToolRequest{}
+	req.Params.Name = "atlantis_plan"
+	req.Params.Arguments = map[string]any{"repo": "owner/repo", "ref": "main", "projects": []any{"proj1"}}
+	res, err := c.CallTool(ctx, req)
+	Ok(t, err)
+	Assert(t, !res.IsError, "unexpected error result")
+	Equals(t, "owner/repo", svc.planReq.Repository)
+	Equals(t, "main", svc.planReq.Ref)
+	Equals(t, "Github", svc.planReq.Type) // defaulted
+	Equals(t, []string{"proj1"}, svc.planReq.Projects)
+	tc, ok := res.Content[0].(mcp.TextContent)
+	Assert(t, ok, "expected text content")
+	Assert(t, strings.Contains(tc.Text, "planned"), "expected planned status")
+	Assert(t, strings.Contains(tc.Text, "1 to add"), "expected terraform output")
+}
+
+func TestApplyTool(t *testing.T) {
+	svc, _, deps := writeDeps()
+	c, ctx := testClientWrite(t, &fakeLocker{}, deps)
+	req := mcp.CallToolRequest{}
+	req.Params.Name = "atlantis_apply"
+	req.Params.Arguments = map[string]any{"repo": "owner/repo", "ref": "main", "type": "Gitlab", "dir": "envs/prod", "pr": float64(7)}
+	res, err := c.CallTool(ctx, req)
+	Ok(t, err)
+	Assert(t, !res.IsError, "unexpected error result")
+	Equals(t, "Gitlab", svc.applyReq.Type)
+	Equals(t, 7, svc.applyReq.PR)
+	Equals(t, 1, len(svc.applyReq.Paths))
+	Equals(t, "envs/prod", svc.applyReq.Paths[0].Directory)
+	Equals(t, "default", svc.applyReq.Paths[0].Workspace)
+}
+
+func TestPlanToolRequiresTarget(t *testing.T) {
+	_, _, deps := writeDeps()
+	c, ctx := testClientWrite(t, &fakeLocker{}, deps)
+	req := mcp.CallToolRequest{}
+	req.Params.Name = "atlantis_plan"
+	req.Params.Arguments = map[string]any{"repo": "owner/repo", "ref": "main"}
+	res, err := c.CallTool(ctx, req)
+	Ok(t, err)
+	Assert(t, res.IsError, "expected error when neither projects nor dir given")
+}
+
+func TestUnlockTool(t *testing.T) {
+	_, del, deps := writeDeps()
+	c, ctx := testClientWrite(t, &fakeLocker{}, deps)
+	req := mcp.CallToolRequest{}
+	req.Params.Name = "atlantis_unlock"
+	req.Params.Arguments = map[string]any{"id": "lock-123"}
+	res, err := c.CallTool(ctx, req)
+	Ok(t, err)
+	Assert(t, !res.IsError, "unexpected error result")
+	Equals(t, "lock-123", del.gotID)
 }
 
 func callText(t *testing.T, c *client.Client, ctx context.Context, name string, args map[string]any) (*mcp.CallToolResult, string) {
@@ -139,7 +256,7 @@ func TestGetLockToolMissingArg(t *testing.T) {
 // Start and Shutdown end to end.
 func TestServerHTTP(t *testing.T) {
 	port := freePort(t)
-	srv := NewServer(port, "v9.9.9", "", &fakeLocker{}, logging.NewNoopLogger(t))
+	srv := NewServer(port, "v9.9.9", "", &fakeLocker{}, nil, logging.NewNoopLogger(t))
 
 	go func() { _ = srv.Start() }()
 	t.Cleanup(func() {
@@ -181,7 +298,7 @@ func TestServerHTTP(t *testing.T) {
 // is enabled, so load balancers can probe it.
 func TestHealthz(t *testing.T) {
 	port := freePort(t)
-	srv := NewServer(port, "v9.9.9", "s3cret", &fakeLocker{}, logging.NewNoopLogger(t))
+	srv := NewServer(port, "v9.9.9", "s3cret", &fakeLocker{}, nil, logging.NewNoopLogger(t))
 	go func() { _ = srv.Start() }()
 	t.Cleanup(func() {
 		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
@@ -205,7 +322,7 @@ func TestHealthz(t *testing.T) {
 // streamable HTTP transport.
 func TestServerHTTPAuth(t *testing.T) {
 	port := freePort(t)
-	srv := NewServer(port, "v9.9.9", "s3cret", &fakeLocker{}, logging.NewNoopLogger(t))
+	srv := NewServer(port, "v9.9.9", "s3cret", &fakeLocker{}, nil, logging.NewNoopLogger(t))
 	go func() { _ = srv.Start() }()
 	t.Cleanup(func() {
 		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)

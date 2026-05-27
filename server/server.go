@@ -1056,7 +1056,14 @@ func NewServer(userConfig UserConfig, config Config) (*Server, error) {
 	}
 
 	if userConfig.MCPEnabled {
-		server.MCPServer = mcp.NewServer(userConfig.MCPPort, config.AtlantisVersion, userConfig.MCPToken, lockingClient, logger)
+		var mcpWrite *mcp.WriteDeps
+		if userConfig.MCPWriteEnabled {
+			mcpWrite = &mcp.WriteDeps{
+				Service:    apiController,
+				DeleteLock: deleteLockCommand,
+			}
+		}
+		server.MCPServer = mcp.NewServer(userConfig.MCPPort, config.AtlantisVersion, userConfig.MCPToken, lockingClient, mcpWrite, logger)
 	}
 
 	validate := validator.New(validator.WithRequiredStructEnabled())

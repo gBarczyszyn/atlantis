@@ -1107,6 +1107,20 @@ ATLANTIS_MCP_TOKEN=secret-token
 
 Bearer token required to call the MCP server (see `--mcp-enabled`). When set, clients must send an `Authorization: Bearer <token>` header; requests without a matching token are rejected with `401 Unauthorized`. If left empty the MCP server runs unauthenticated and should only be reachable over a trusted network. Note that the MCP server is served over plain HTTP, so place it behind TLS termination if the token traverses an untrusted network.
 
+### `--mcp-write-enabled` <Badge text="v0.44.0+" type="info"/>
+
+```bash
+atlantis server --mcp-write-enabled
+# or
+ATLANTIS_MCP_WRITE_ENABLED=true
+```
+
+Also expose the mutating MCP tools (`atlantis_plan`, `atlantis_apply`, `atlantis_unlock`) in addition to the read-only ones. Requires `--mcp-enabled`. Defaults to `false`.
+
+::: warning
+Like the Atlantis [API](api-endpoints.md), `atlantis_apply` operates on a repo/ref and does **not** enforce PR-based `apply_requirements` such as `approved` or `mergeable`. Anyone holding the MCP token can change infrastructure on allowlisted repos, so keep `--mcp-token` set and restrict network access to the MCP port.
+:::
+
 ### `--parallel-apply` <Badge text="v0.22.0+" type="info"/>
 
 ```bash
