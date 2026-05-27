@@ -8,6 +8,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"net"
 	"net/http"
 	"net/http/httptest"
@@ -174,6 +175,30 @@ func TestServerHTTP(t *testing.T) {
 	tc, ok := res.Content[0].(mcp.TextContent)
 	Assert(t, ok, "expected text content")
 	Equals(t, "v9.9.9", tc.Text)
+}
+
+// TestHealthz verifies /healthz is reachable without a token even when auth
+// is enabled, so load balancers can probe it.
+func TestHealthz(t *testing.T) {
+	port := freePort(t)
+	srv := NewServer(port, "v9.9.9", "s3cret", &fakeLocker{}, logging.NewNoopLogger(t))
+	go func() { _ = srv.Start() }()
+	t.Cleanup(func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+		defer cancel()
+		_ = srv.Shutdown(ctx)
+	})
+
+	addr := fmt.Sprintf("127.0.0.1:%d", port)
+	waitListening(t, addr)
+
+	resp, err := http.Get("http://" + addr + "/healthz")
+	Ok(t, err)
+	defer resp.Body.Close()
+	Equals(t, http.StatusOK, resp.StatusCode)
+	body, err := io.ReadAll(resp.Body)
+	Ok(t, err)
+	Equals(t, `{"status":"ok"}`, string(body))
 }
 
 // TestServerHTTPAuth verifies the bearer token is enforced over the real

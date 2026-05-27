@@ -45,19 +45,29 @@ type lockView struct {
 
 // NewServer builds an MCP server with the read-only Atlantis tools registered.
 // If token is non-empty, every request must carry a matching
-// "Authorization: Bearer <token>" header.
+// "Authorization: Bearer <token>" header, except for the /healthz endpoint
+// which is always unauthenticated so load balancers can probe it.
 func NewServer(port int, version, token string, locker locking.Locker, logger logging.SimpleLogging) *Server {
-	var handler http.Handler = mcpserver.NewStreamableHTTPServer(newMCPServer(version, locker))
-	handler = bearerAuth(token, handler)
+	mcpHandler := bearerAuth(token, mcpserver.NewStreamableHTTPServer(newMCPServer(version, locker)))
+	mux := http.NewServeMux()
+	mux.HandleFunc("/healthz", healthz)
+	mux.Handle("/", mcpHandler)
 	return &Server{
 		logger: logger,
 		port:   port,
 		httpServer: &http.Server{
 			Addr:              fmt.Sprintf(":%d", port),
-			Handler:           handler,
+			Handler:           mux,
 			ReadHeaderTimeout: 10 * time.Second,
 		},
 	}
+}
+
+// healthz is an unauthenticated liveness endpoint for load balancer probes.
+func healthz(w http.ResponseWriter, _ *http.Request) {
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusOK)
+	_, _ = w.Write([]byte(`{"status":"ok"}`))
 }
 
 // bearerAuth wraps next with a bearer-token check. When token is empty the
