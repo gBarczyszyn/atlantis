@@ -117,6 +117,7 @@ const (
 	MaxCommentsPerCommand            = "max-comments-per-command"
 	MCPEnabledFlag                   = "mcp-enabled"
 	MCPPortFlag                      = "mcp-port"
+	MCPTokenFlag                     = "mcp-token"
 	ParallelPoolSize                 = "parallel-pool-size"
 	PendingApplyStatusFlag           = "pending-apply-status"
 	StatsNamespace                   = "stats-namespace"
@@ -411,6 +412,11 @@ var stringFlags = map[string]stringFlag{
 	MarkdownTemplateOverridesDirFlag: {
 		description:  "Directory for custom overrides to the markdown templates used for comments.",
 		defaultValue: DefaultMarkdownTemplateOverridesDir,
+	},
+	MCPTokenFlag: {
+		description: "Bearer token required to call the MCP server (see --" + MCPEnabledFlag + "). When set, clients must send " +
+			"'Authorization: Bearer <token>'. If left empty the MCP server runs unauthenticated, so it should only be reachable " +
+			"over a trusted network. Can also be specified via the ATLANTIS_MCP_TOKEN environment variable.",
 	},
 	StatsNamespace: {
 		description:  "Namespace for aggregating stats.",
@@ -1219,6 +1225,9 @@ func (s *ServerCmd) securityWarnings(userConfig *server.UserConfig) {
 	}
 	if userConfig.AzureDevopsWebhookUser != "" && userConfig.AzureDevopsWebhookPassword == "" && !s.SilenceOutput {
 		s.Logger.Warn("no Azure DevOps webhook user and password set. This could allow attackers to spoof requests from Azure DevOps.")
+	}
+	if userConfig.MCPEnabled && userConfig.MCPToken == "" && !s.SilenceOutput {
+		s.Logger.Warn("no MCP token set. The MCP server is unauthenticated and should only be reachable over a trusted network")
 	}
 }
 

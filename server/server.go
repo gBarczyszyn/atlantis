@@ -1056,7 +1056,7 @@ func NewServer(userConfig UserConfig, config Config) (*Server, error) {
 	}
 
 	if userConfig.MCPEnabled {
-		server.MCPServer = mcp.NewServer(userConfig.MCPPort, config.AtlantisVersion, lockingClient, logger)
+		server.MCPServer = mcp.NewServer(userConfig.MCPPort, config.AtlantisVersion, userConfig.MCPToken, lockingClient, logger)
 	}
 
 	validate := validator.New(validator.WithRequiredStructEnabled())

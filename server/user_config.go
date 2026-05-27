@@ -89,6 +89,7 @@ type UserConfig struct {
 	MaxCommentsPerCommand           int    `mapstructure:"max-comments-per-command"`
 	MCPEnabled                      bool   `mapstructure:"mcp-enabled"`
 	MCPPort                         int    `mapstructure:"mcp-port"`
+	MCPToken                        string `mapstructure:"mcp-token"`
 	IgnoreVCSStatusNames            string `mapstructure:"ignore-vcs-status-names"`
 	ParallelPoolSize                int    `mapstructure:"parallel-pool-size"`
 	ParallelPlan                    bool   `mapstructure:"parallel-plan"`

@@ -8,9 +8,11 @@ package mcp
 
 import (
 	"context"
+	"crypto/subtle"
 	"encoding/json"
 	"fmt"
 	"net/http"
+	"strings"
 	"time"
 
 	"github.com/mark3labs/mcp-go/mcp"
@@ -42,8 +44,11 @@ type lockView struct {
 }
 
 // NewServer builds an MCP server with the read-only Atlantis tools registered.
-func NewServer(port int, version string, locker locking.Locker, logger logging.SimpleLogging) *Server {
-	handler := mcpserver.NewStreamableHTTPServer(newMCPServer(version, locker))
+// If token is non-empty, every request must carry a matching
+// "Authorization: Bearer <token>" header.
+func NewServer(port int, version, token string, locker locking.Locker, logger logging.SimpleLogging) *Server {
+	var handler http.Handler = mcpserver.NewStreamableHTTPServer(newMCPServer(version, locker))
+	handler = bearerAuth(token, handler)
 	return &Server{
 		logger: logger,
 		port:   port,
@@ -53,6 +58,24 @@ func NewServer(port int, version string, locker locking.Locker, logger logging.S
 			ReadHeaderTimeout: 10 * time.Second,
 		},
 	}
+}
+
+// bearerAuth wraps next with a bearer-token check. When token is empty the
+// check is skipped and the MCP server runs unauthenticated.
+func bearerAuth(token string, next http.Handler) http.Handler {
+	if token == "" {
+		return next
+	}
+	expected := []byte("Bearer " + token)
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		got := r.Header.Get("Authorization")
+		if subtle.ConstantTimeCompare([]byte(strings.TrimSpace(got)), expected) != 1 {
+			w.Header().Set("WWW-Authenticate", "Bearer")
+			http.Error(w, "unauthorized", http.StatusUnauthorized)
+			return
+		}
+		next.ServeHTTP(w, r)
+	})
 }
 
 func newMCPServer(version string, locker locking.Locker) *mcpserver.MCPServer {

@@ -9,6 +9,9 @@ import (
 	"errors"
 	"fmt"
 	"net"
+	"net/http"
+	"net/http/httptest"
+	"strings"
 	"testing"
 	"time"
 
@@ -135,7 +138,7 @@ func TestGetLockToolMissingArg(t *testing.T) {
 // Start and Shutdown end to end.
 func TestServerHTTP(t *testing.T) {
 	port := freePort(t)
-	srv := NewServer(port, "v9.9.9", &fakeLocker{}, logging.NewNoopLogger(t))
+	srv := NewServer(port, "v9.9.9", "", &fakeLocker{}, logging.NewNoopLogger(t))
 
 	go func() { _ = srv.Start() }()
 	t.Cleanup(func() {
@@ -173,10 +176,100 @@ func TestServerHTTP(t *testing.T) {
 	Equals(t, "v9.9.9", tc.Text)
 }
 
+// TestServerHTTPAuth verifies the bearer token is enforced over the real
+// streamable HTTP transport.
+func TestServerHTTPAuth(t *testing.T) {
+	port := freePort(t)
+	srv := NewServer(port, "v9.9.9", "s3cret", &fakeLocker{}, logging.NewNoopLogger(t))
+	go func() { _ = srv.Start() }()
+	t.Cleanup(func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+		defer cancel()
+		_ = srv.Shutdown(ctx)
+	})
+
+	addr := fmt.Sprintf("127.0.0.1:%d", port)
+	waitListening(t, addr)
+
+	url := "http://" + addr + "/mcp"
+	body := `{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"t","version":"1"}}}`
+
+	doPost := func(auth string) int {
+		req, err := http.NewRequest(http.MethodPost, url, strings.NewReader(body))
+		Ok(t, err)
+		req.Header.Set("Content-Type", "application/json")
+		req.Header.Set("Accept", "application/json, text/event-stream")
+		if auth != "" {
+			req.Header.Set("Authorization", auth)
+		}
+		resp, err := http.DefaultClient.Do(req)
+		Ok(t, err)
+		defer resp.Body.Close()
+		return resp.StatusCode
+	}
+
+	Equals(t, http.StatusUnauthorized, doPost(""))
+	Equals(t, http.StatusUnauthorized, doPost("Bearer wrong"))
+	Assert(t, doPost("Bearer s3cret") != http.StatusUnauthorized, "valid token must not be rejected")
+}
+
 func freePort(t *testing.T) int {
 	t.Helper()
 	l, err := net.Listen("tcp", "127.0.0.1:0")
 	Ok(t, err)
 	defer l.Close()
 	return l.Addr().(*net.TCPAddr).Port
+}
+
+func waitListening(t *testing.T, addr string) {
+	t.Helper()
+	for i := 0; i < 100; i++ {
+		conn, err := net.DialTimeout("tcp", addr, 100*time.Millisecond)
+		if err == nil {
+			conn.Close()
+			return
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	t.Fatalf("server never started listening on %s", addr)
+}
+
+func bearerAuthStatus(t *testing.T, token, header string) (int, bool) {
+	t.Helper()
+	called := false
+	next := http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		called = true
+		w.WriteHeader(http.StatusOK)
+	})
+	req := httptest.NewRequest(http.MethodPost, "/mcp", nil)
+	if header != "" {
+		req.Header.Set("Authorization", header)
+	}
+	rec := httptest.NewRecorder()
+	bearerAuth(token, next).ServeHTTP(rec, req)
+	return rec.Code, called
+}
+
+func TestBearerAuthDisabledWhenEmpty(t *testing.T) {
+	code, called := bearerAuthStatus(t, "", "")
+	Equals(t, http.StatusOK, code)
+	Assert(t, called, "next handler should be called when no token is configured")
+}
+
+func TestBearerAuthRejectsMissingHeader(t *testing.T) {
+	code, called := bearerAuthStatus(t, "s3cret", "")
+	Equals(t, http.StatusUnauthorized, code)
+	Assert(t, !called, "next handler must not be called without a valid token")
+}
+
+func TestBearerAuthRejectsWrongToken(t *testing.T) {
+	code, called := bearerAuthStatus(t, "s3cret", "Bearer nope")
+	Equals(t, http.StatusUnauthorized, code)
+	Assert(t, !called, "next handler must not be called with a wrong token")
+}
+
+func TestBearerAuthAcceptsValidToken(t *testing.T) {
+	code, called := bearerAuthStatus(t, "s3cret", "Bearer s3cret")
+	Equals(t, http.StatusOK, code)
+	Assert(t, called, "next handler should be called with a valid token")
 }

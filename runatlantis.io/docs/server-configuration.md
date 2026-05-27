@@ -1097,6 +1097,16 @@ ATLANTIS_MCP_PORT=4142
 
 Port to bind the MCP server to when `--mcp-enabled` is set. Defaults to `4142`.
 
+### `--mcp-token` <Badge text="v0.44.0+" type="info"/>
+
+```bash
+atlantis server --mcp-token=secret-token
+# or
+ATLANTIS_MCP_TOKEN=secret-token
+```
+
+Bearer token required to call the MCP server (see `--mcp-enabled`). When set, clients must send an `Authorization: Bearer <token>` header; requests without a matching token are rejected with `401 Unauthorized`. If left empty the MCP server runs unauthenticated and should only be reachable over a trusted network. Note that the MCP server is served over plain HTTP, so place it behind TLS termination if the token traverses an untrusted network.
+
 ### `--parallel-apply` <Badge text="v0.22.0+" type="info"/>
 
 ```bash
