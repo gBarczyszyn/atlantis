@@ -115,6 +115,8 @@ const (
 	LogLevelFlag                     = "log-level"
 	MarkdownTemplateOverridesDirFlag = "markdown-template-overrides-dir"
 	MaxCommentsPerCommand            = "max-comments-per-command"
+	MCPEnabledFlag                   = "mcp-enabled"
+	MCPPortFlag                      = "mcp-port"
 	ParallelPoolSize                 = "parallel-pool-size"
 	PendingApplyStatusFlag           = "pending-apply-status"
 	StatsNamespace                   = "stats-namespace"
@@ -179,6 +181,7 @@ const (
 	DefaultLogLevel                     = "info"
 	DefaultIgnoreVCSStatusNames         = ""
 	DefaultMaxCommentsPerCommand        = 100
+	DefaultMCPPort                      = 4142
 	DefaultParallelPoolSize             = 15
 	DefaultStatsNamespace               = "atlantis"
 	DefaultPort                         = 4141
@@ -568,6 +571,11 @@ var boolFlags = map[string]boolFlag{
 		description:  "Include git untracked files in the Atlantis modified file scope.",
 		defaultValue: false,
 	},
+	MCPEnabledFlag: {
+		description: "Enable an experimental Model Context Protocol (MCP) server exposing read-only " +
+			"Atlantis state (locks, version) as tools for AI assistants. Served on a separate port, see --" + MCPPortFlag + ".",
+		defaultValue: false,
+	},
 	ParallelPlanFlag: {
 		description:  "Run plan operations in parallel.",
 		defaultValue: false,
@@ -664,6 +672,10 @@ var intFlags = map[string]intFlag{
 	MaxCommentsPerCommand: {
 		description:  "If non-zero, the maximum number of comments to split command output into before truncating.",
 		defaultValue: DefaultMaxCommentsPerCommand,
+	},
+	MCPPortFlag: {
+		description:  "Port to bind the MCP server to when --" + MCPEnabledFlag + " is set.",
+		defaultValue: DefaultMCPPort,
 	},
 	GiteaPageSizeFlag: {
 		description:  "Optional value that specifies the number of results per page to expect from Gitea.",
@@ -960,6 +972,9 @@ func (s *ServerCmd) setDefaults(c *server.UserConfig, v *viper.Viper) {
 	}
 	if c.Port == 0 {
 		c.Port = DefaultPort
+	}
+	if c.MCPPort == 0 {
+		c.MCPPort = DefaultMCPPort
 	}
 	if c.RedisDB == 0 {
 		c.RedisDB = DefaultRedisDB

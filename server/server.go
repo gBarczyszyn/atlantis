@@ -40,6 +40,7 @@ import (
 	"github.com/runatlantis/atlantis/server/core/redis"
 	"github.com/runatlantis/atlantis/server/core/terraform/tfclient"
 	"github.com/runatlantis/atlantis/server/jobs"
+	"github.com/runatlantis/atlantis/server/mcp"
 	"github.com/runatlantis/atlantis/server/metrics"
 	"github.com/runatlantis/atlantis/server/scheduled"
 
@@ -124,6 +125,7 @@ type Server struct {
 	ScheduledExecutorService       *scheduled.ExecutorService
 	DisableGlobalApplyLock         bool
 	EnableProfilingAPI             bool
+	MCPServer                      *mcp.Server
 	database                       db.Database
 }
 
@@ -1053,6 +1055,10 @@ func NewServer(userConfig UserConfig, config Config) (*Server, error) {
 		database:                       database,
 	}
 
+	if userConfig.MCPEnabled {
+		server.MCPServer = mcp.NewServer(userConfig.MCPPort, config.AtlantisVersion, lockingClient, logger)
+	}
+
 	validate := validator.New(validator.WithRequiredStructEnabled())
 
 	err = validate.Struct(server)
@@ -1142,6 +1148,14 @@ func (s *Server) Start() error {
 			s.Logger.Err(err.Error())
 		}
 	}()
+
+	if s.MCPServer != nil {
+		go func() {
+			if err := s.MCPServer.Start(); err != nil {
+				s.Logger.Err("MCP server: %s", err.Error())
+			}
+		}()
+	}
 	<-stop
 
 	s.Logger.Warn("Received interrupt. Waiting for in-progress operations to complete")
@@ -1159,6 +1173,11 @@ func (s *Server) Start() error {
 
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
+	if s.MCPServer != nil {
+		if err := s.MCPServer.Shutdown(ctx); err != nil {
+			s.Logger.Err("while shutting down MCP server: %s", err)
+		}
+	}
 	if err := server.Shutdown(ctx); err != nil {
 		return fmt.Errorf("while shutting down: %s", err)
 	}

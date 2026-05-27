@@ -110,6 +110,8 @@ var testFlags = map[string]any{
 	LogLevelFlag:                     "debug",
 	MarkdownTemplateOverridesDirFlag: "/path2",
 	MaxCommentsPerCommand:            10,
+	MCPEnabledFlag:                   true,
+	MCPPortFlag:                      4142,
 	StatsNamespace:                   "atlantis",
 	AllowDraftPRs:                    true,
 	PortFlag:                         8181,
