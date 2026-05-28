@@ -40,6 +40,10 @@ type APIController struct {
 	WorkingDir                     events.WorkingDir                     `validate:"required"`
 	WorkingDirLocker               events.WorkingDirLocker               `validate:"required"`
 	CommitStatusUpdater            events.CommitStatusUpdater            `validate:"required"`
+	// PullReqStatusFetcher is optional. When set and the request has a PR
+	// number, it is used to populate command.Context.PullRequestStatus so apply
+	// requirements like 'mergeable' can be evaluated against real VCS state.
+	PullReqStatusFetcher vcs.PullReqStatusFetcher
 	// SilenceVCSStatusNoProjects is whether API should set commit status if no projects are found
 	SilenceVCSStatusNoProjects bool
 }
@@ -363,19 +367,31 @@ func (a *APIController) buildContext(request *APIRequest) (*command.Context, int
 		return nil, http.StatusForbidden, fmt.Errorf("repo not allowlisted")
 	}
 
-	return &command.Context{
+	pull := models.PullRequest{
+		Num:        request.PR,
+		BaseBranch: request.Ref,
+		HeadBranch: request.Ref,
+		HeadCommit: request.Ref,
+		BaseRepo:   baseRepo,
+	}
+	ctx := &command.Context{
 		HeadRepo: baseRepo,
-		Pull: models.PullRequest{
-			Num:        request.PR,
-			BaseBranch: request.Ref,
-			HeadBranch: request.Ref,
-			HeadCommit: request.Ref,
-			BaseRepo:   baseRepo,
-		},
-		Scope: a.Scope,
-		Log:   a.Logger,
-		API:   true,
-	}, http.StatusOK, nil
+		Pull:     pull,
+		Scope:    a.Scope,
+		Log:      a.Logger,
+		API:      true,
+	}
+	// When a real PR is supplied, populate PullRequestStatus so that apply
+	// requirements (e.g. 'mergeable', 'approved') can evaluate against actual
+	// VCS state instead of always defaulting to false.
+	if request.PR > 0 && a.PullReqStatusFetcher != nil {
+		status, err := a.PullReqStatusFetcher.FetchPullStatus(a.Logger, pull)
+		if err != nil {
+			return nil, http.StatusInternalServerError, fmt.Errorf("fetching pull status: %v", err)
+		}
+		ctx.PullRequestStatus = status
+	}
+	return ctx, http.StatusOK, nil
 }
 
 // RunPlan validates the request, prepares the workspace, and runs plan. It is
